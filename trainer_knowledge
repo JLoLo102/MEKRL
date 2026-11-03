@@ -1,0 +1,903 @@
+import gc
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+from tensorboardX import SummaryWriter
+
+from tools.utils import *
+from sklearn.metrics import f1_score, average_precision_score, precision_score
+from sklearn.preprocessing import label_binarize
+
+def mmrl_loss_full(logits_c, logits_r, labels, fc, f0, wt, w0,
+                   lambda_cos=0.5, alpha=0.7):
+
+    # ===== 分类损失 =====
+    loss_c = F.cross_entropy(logits_c, labels)
+    loss_r = F.cross_entropy(logits_r, labels)
+
+    # ===== 图像 cosine =====
+    fc = F.normalize(fc, dim=-1)
+    f0 = F.normalize(f0, dim=-1)
+    loss_v = 1 - (fc * f0).sum(dim=-1).mean()
+
+    # ===== 文本 cosine（新增）=====
+    wt = F.normalize(wt, dim=-1)
+    w0 = F.normalize(w0, dim=-1)
+    loss_t = 1 - (wt * w0).sum(dim=-1).mean()
+
+    # ===== 总损失 =====
+    loss = alpha * loss_c + (1 - alpha) * loss_r \
+           + lambda_cos * (loss_v + loss_t)
+
+    return loss
+
+def build_knowledge_tensor(data):
+    obs_paths, reasoning_paths, intent_paths, category_paths = data
+    B = len(obs_paths)
+
+    obs_list = []
+    reasoning_list = []
+    intent_list = []
+    cate_list = []
+
+    for i in range(B):
+        obs_list.append(torch.load(obs_paths[i])['embedding'])
+        reasoning_list.append(torch.load(reasoning_paths[i])['embedding'])
+        intent_list.append(torch.load(intent_paths[i])['embedding'])
+        cate_list.append(torch.load(category_paths[i])['embedding'])
+
+    # [B, 2560]
+    obs_tensor = torch.stack(obs_list, dim=0)
+    reasoning_tensor = torch.stack(reasoning_list, dim=0)
+    intent_tensor = torch.stack(intent_list, dim=0)
+    cate_tensor = torch.stack(cate_list, dim=0)
+
+    # [B, 4, 2560]
+    knowledge = torch.stack(
+        [obs_tensor, reasoning_tensor, intent_tensor, cate_tensor],
+        dim=1
+    )
+
+    return knowledge
+
+def symmetric_kl(p, q, T=1.0):
+    """
+    p, q: [B, D]
+    """
+    p_log = F.log_softmax(p / T, dim=-1)
+    q_log = F.log_softmax(q / T, dim=-1)
+
+    p_prob = F.softmax(p / T, dim=-1)
+    q_prob = F.softmax(q / T, dim=-1)
+
+    kl_pq = F.kl_div(p_log, q_prob, reduction='batchmean')
+    kl_qp = F.kl_div(q_log, p_prob, reduction='batchmean')
+
+    return (kl_pq + kl_qp) / 2
+
+def cosine_loss(p, q):
+    p = F.normalize(p, dim=-1)
+    q = F.normalize(q, dim=-1)
+    return 1 - (p * q).sum(dim=-1).mean()
+
+def mutual_prediction_loss(
+        visual_logits,
+        knowledge_logits,
+        T=2.0
+):
+
+    visual_prob = F.softmax(
+        visual_logits/T,
+        dim=-1
+    )
+
+    knowledge_prob = F.softmax(
+        knowledge_logits/T,
+        dim=-1
+    )
+
+
+    loss_vk = F.kl_div(
+        F.log_softmax(visual_logits/T,dim=-1),
+        knowledge_prob,
+        reduction='batchmean'
+    )
+
+
+    loss_kv = F.kl_div(
+        F.log_softmax(knowledge_logits/T,dim=-1),
+        visual_prob,
+        reduction='batchmean'
+    )
+
+
+    return (loss_vk + loss_kv)/2*T*T
+
+def load_pretrained(model, path):
+    ckpt = torch.load(path, map_location="cpu")
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
+
+    print("Missing keys:", missing)
+    print("Unexpected keys:", unexpected)
+
+    return model
+
+def freeze_module(module):
+    for p in module.parameters():
+        p.requires_grad = False
+
+class KnowledgeFilter(nn.Module):
+
+    def __init__(self,dim=768):
+
+        super().__init__()
+
+        self.net=nn.Sequential(
+
+            nn.Linear(dim*2+1,512),
+
+            nn.ReLU(),
+
+            nn.Linear(512,128),
+
+            nn.ReLU(),
+
+            nn.Linear(128,1)
+
+        )
+
+    def forward(
+
+            self,
+
+            visual_feat,
+
+            knowledge_feat,
+
+            similarity
+
+    ):
+
+        """
+        visual_feat
+
+            [B,768]
+
+        knowledge_feat
+
+            [B,K,4,768]
+
+        similarity
+
+            [B,K]
+
+        """
+
+        B,K,T,D = knowledge_feat.shape
+
+        # ---------- visual ----------
+        visual_feat = visual_feat.unsqueeze(1)
+
+        visual_feat = visual_feat.unsqueeze(2)
+
+        visual_feat = visual_feat.expand( -1,K,T,-1)
+
+        # ---------- similarity ----------
+
+        similarity = similarity.unsqueeze(-1)
+
+        similarity = similarity.unsqueeze(-1)
+
+        similarity = similarity.expand(-1, -1,T,-1)
+
+        score=self.net(
+
+            torch.cat(
+
+                [
+
+                    visual_feat,
+
+                    knowledge_feat,
+
+                    similarity
+
+                ],
+
+                dim=-1
+
+            )
+
+        )
+
+        return torch.sigmoid(score)
+
+class CrossAttentionFusion(nn.Module):
+    """
+    Knowledge-guided Cross-Attention Residual Fusion
+    """
+
+    def __init__(self, dim=768, num_heads=8, dropout=0.1, gamma=0.2):
+        super(CrossAttentionFusion, self).__init__()
+
+        self.dim = dim
+        self.gamma = gamma
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.norm = nn.LayerNorm(dim)
+
+        # optional learnable gate（比固定gamma更好）
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(
+            self,
+            image_feat,
+            knowledge_feat,
+            knowledge_weight
+    ):
+        if image_feat.dim() == 2:
+            image_feat = image_feat.unsqueeze(1)
+
+        knowledge_feat = knowledge_feat * knowledge_weight
+
+        attn_out, _ = self.attn(
+
+            query=image_feat,
+
+            key=knowledge_feat,
+
+            value=knowledge_feat
+
+        )
+
+        gate = self.gate(image_feat)
+
+        out = image_feat + gate * attn_out
+
+        out = self.norm(out)
+
+        return out.squeeze(1)
+
+# class KnowledgeAdvantage(nn.Module):
+#
+#     def __init__(self,dim=768,num_classes=527):
+#         super().__init__()
+#
+#         self.net=nn.Sequential(
+#             nn.Linear(dim*2,768),
+#             nn.GELU(),
+#             nn.Linear(768,num_classes)
+#         )
+#
+#
+#     def forward(self,x,k):
+#
+#         feat=torch.cat([x,k],dim=-1)
+#
+#         return self.net(feat)
+
+class KnowledgeAdvantage(nn.Module):
+
+    def __init__(self,dim=768):
+
+        super().__init__()
+
+        self.net=nn.Sequential(
+
+            nn.Linear(dim*2+1,512),
+
+            nn.GELU(),
+
+            nn.Linear(512,128),
+
+            nn.GELU(),
+
+            nn.Linear(128,1)
+
+        )
+
+    def forward(self,visual,knowledge,similarity):
+
+        # similarity=similarity.mean(
+        #
+        #     dim=1,
+        #
+        #     keepdim=True
+        #
+        # )
+        similarity, _ = torch.max(similarity,dim=1,keepdim=True)
+
+        x=torch.cat(
+
+            [
+
+                visual,
+
+                knowledge,
+
+                similarity
+
+            ],
+
+            dim=-1
+
+        )
+
+        return torch.sigmoid(
+
+            self.net(x)
+
+        )
+
+class ModelNetTrainer(object):
+    def __init__(self, model, train_loader, val_loader, optimizer, loss_fn, model_name, log_dir, num_views=6):
+
+        self.optimizer = optimizer
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.loss_fn = loss_fn
+        self.model_name = model_name
+        self.log_dir = log_dir
+        self.num_views = num_views
+
+        self.model.cuda()
+
+        # ==============================
+        # 1. load pretrained weights
+        # ==============================
+        # self.model = load_pretrained(
+        #     self.model,
+        #     "/text_clip_cs_HBridge/best_model.pth"
+        # )
+
+        self.model = load_pretrained(
+            self.model,
+            "/knowledge_retrival_fusion/best_model.pth"
+        )
+
+        # freeze_module(self.model.module.clip_encoder)
+        freeze_module(self.model.module.net_1)
+
+        if self.log_dir is not None:
+            self.writer = SummaryWriter(log_dir)
+
+        # self.scale = nn.Parameter(torch.tensor(1.0))
+
+        self.knowledge_proj = nn.Sequential(
+            nn.Linear(2560, 1024),
+            nn.GELU(),
+            nn.Linear(1024, 768)
+        ).cuda()
+        self.kar = CrossAttentionFusion(dim=768).cuda()
+        self.filter = KnowledgeFilter(dim=768).cuda()
+
+
+        memory = torch.load(
+            "*/selected_527/knowledge_memory_bank.pt",
+            map_location="cpu"
+        )
+
+        self.memory_visual = F.normalize(
+            memory["visual"].float(),
+            dim=-1
+        ).cuda()
+        self.memory_knowledge = memory["knowledge"].float().cuda()
+
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(768, 768),
+        #     nn.ReLU(),
+        #     nn.Linear(768, 768),
+        #     nn.Sigmoid()
+        # ).cuda()
+        self.advantage = KnowledgeAdvantage(
+            dim=768
+        ).cuda()
+
+        self.head = nn.Linear(768, 527).cuda()
+        self.knowledge_head = nn.Linear(768, 527).cuda()
+    # def retrieve_knowledge(
+    #         self,
+    #         query_feat,
+    #         topk=5
+    # ):
+    #
+    #     query_feat = F.normalize(query_feat, dim=-1)
+    #
+    #     similarity = torch.matmul(
+    #         query_feat,
+    #         self.memory_visual.t()
+    #     )
+    #
+    #     score, index = torch.topk(
+    #         similarity,
+    #         topk,
+    #         dim=1
+    #     )
+    #
+    #     retrieved = []
+    #
+    #     for i in range(query_feat.size(0)):
+    #         knowledge = self.memory_knowledge[index[i]]
+    #
+    #         # [topk,4,768]
+    #
+    #         weight = F.softmax(score[i], dim=0)
+    #
+    #         knowledge = (
+    #                 knowledge *
+    #                 weight[:, None, None]
+    #         ).sum(dim=0)
+    #
+    #         retrieved.append(knowledge)
+    #
+    #     return torch.stack(retrieved)
+    def retrieve_knowledge(
+            self,
+            query_feat,
+            topk=10,
+            threshold=0.75
+    ):
+
+        query_feat = F.normalize(query_feat, dim=-1)
+
+        similarity = torch.matmul(
+            query_feat,
+            self.memory_visual.t()
+        )
+
+        score, index = torch.topk(
+            similarity,
+            topk,
+            dim=1
+        )
+
+        retrieved = []
+
+        similarity_list = []
+
+        for i in range(query_feat.size(0)):
+
+            keep = score[i] > threshold
+
+            if keep.sum() == 0:
+                keep[0] = True
+
+            knowledge = self.memory_knowledge[
+                index[i][keep]
+            ]
+
+            sim = score[i][keep]
+
+            retrieved.append(knowledge)
+
+            similarity_list.append(sim)
+
+        maxk = max([k.size(0) for k in similarity_list])
+
+        knowledge_pad = []
+
+        sim_pad = []
+
+        for k, s in zip(retrieved, similarity_list):
+
+            pad = maxk - k.size(0)
+
+            if pad > 0:
+                k = F.pad(
+                    k,
+                    (0, 0, 0, 0, 0, pad)
+                )
+
+                s = F.pad(
+                    s,
+                    (0, pad)
+                )
+
+            knowledge_pad.append(k)
+
+            sim_pad.append(s)
+
+        return torch.stack(
+            knowledge_pad
+        ), torch.stack(
+            sim_pad
+        )
+
+    def train(self, n_epochs):
+
+        best_top5 = 0
+        i_acc = 0
+        self.model.train()
+        for epoch in range(n_epochs):
+
+            # plot learning rate
+            lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+            self.writer.add_scalar('params/lr', lr, epoch)
+
+            # train one epoch
+
+            for i, data in enumerate(self.train_loader):
+                if self.model_name == 'MEKRL':
+                    # N batch_size V view C channels H height W weight
+                    # print(data[1].size)
+                    N, V, C, H, W = data[1].size()
+                    in_data = Variable(data[1]).view(-1, C, H, W).cuda()
+                else:
+                    in_data = Variable(data[1].cuda())
+                target = Variable(data[0]).cuda().long()
+                # target_single = target.unsqueeze(1).repeat(1, self.num_views).view(-1)
+                transposed = list(zip(*data[2]))
+
+
+
+
+                # gt_knowledge_emb=build_knowledge_tensor(data[3])
+                # # transposed=data[2]
+                # gt_knowledge_emb = self.knowledge_proj(gt_knowledge_emb.cuda().float())  # [B,4,768]
+
+                # global_emb = self.knowledge_proj(data[4]["embedding"].cuda().float())
+                # gt_global = gt_knowledge_emb.mean(dim=1)
+
+                self.optimizer.zero_grad()
+
+                # out_data= self.model(in_data)
+                # out_data,view_feats= self.model(in_data)
+                # out_data, loss_cs,loss_clip  = self.model(in_data,transposed)
+                # out_data, loss_cs, loss_clip = self.model(in_data, transposed)
+                # out_data, logits_c, logits_r = self.model(in_data, transposed)
+                # out_data,  loss_clip = self.model(in_data, transposed)
+                # out_data, loss_align= self.model(in_data, transposed)
+                # out_data, loss_structxlip = self.model(in_data, transposed)
+                # out_data, logits_c, logits_r, fc, f0, wt, w0 = self.model(in_data, transposed)
+                # out_data = self.model(in_data, transposed)
+                _, loss_cs, loss_clip,out_data_feat = self.model(in_data, transposed)
+
+
+                visual_feat=out_data_feat
+                # knowledge_feat = self.kar(out_data_feat, knowledge_emb)
+
+                retrieved_knowledge,similarity = self.retrieve_knowledge(
+                    out_data_feat,
+                    topk=10
+                )
+
+
+                knowledge_weight = self.filter(
+                    out_data_feat,
+                    retrieved_knowledge,
+                    similarity
+                )
+
+                B, K, T, D = retrieved_knowledge.shape
+                retrieved_knowledge = retrieved_knowledge.view(B, K * T, D)
+                knowledge_weight = knowledge_weight.view(B, K * T, 1)
+
+                # knowledge_feat = self.kar(
+                #               out_data_feat,
+                #     retrieved_knowledge
+                # )
+
+                knowledge_feat = self.kar(
+
+                    out_data_feat,
+
+                    retrieved_knowledge,
+
+                    knowledge_weight
+
+                )
+
+                # out_data = self.model(in_data,target)
+
+
+
+                # loss_mmrl = mmrl_loss_full(
+                #     logits_c,
+                #     logits_r,
+                #     target,
+                #     fc,
+                #     f0,
+                #     wt,
+                #     w0,
+                #     lambda_cos=0.5,
+                #     alpha=0.7
+                # )
+                # L_kd = cosine_loss(knowledge_feat,gt_global)
+                L_kt=symmetric_kl(visual_feat,knowledge_feat, T=1.0)
+                L_cos = cosine_loss( visual_feat,knowledge_feat)
+
+
+                # similarity (important!)
+                # sim = F.cosine_similarity(out_data_feat, knowledge_emb, dim=-1).unsqueeze(-1)
+
+                # gate = self.mlp(knowledge_emb) * torch.sigmoid(self.scale * sim)
+                # out_fusion_feat = out_data_feat + gate * (out_data_feat - knowledge_emb)
+
+                # out_fusion_feat = out_data_feat + knowledge_emb
+
+                visual_data=self.head(visual_feat)
+                knowledge_data = self.knowledge_head(knowledge_feat)
+
+                # gate = self.advantage(
+                #     visual_feat,
+                #     knowledge_feat
+                # )
+
+                gate = self.advantage(
+
+                    visual_feat,
+
+                    knowledge_feat,
+
+                    similarity
+
+                )
+
+                out_data=(1-gate)*visual_data+gate*knowledge_data
+
+                loss_adv = F.cross_entropy(
+                    out_data,
+                    target
+                )
+
+
+
+                loss_vis = self.loss_fn(visual_data, target)
+                loss_cls = F.cross_entropy(knowledge_data, target)
+                # loss = loss_cls + 0.3 * loss_mmrl
+                # loss = loss_cls + 0.3 * loss_structxlip
+                # loss = loss_cls + 0.1 * loss_cs + 0.1 * loss_clip
+                # loss =  loss_cls + L_kt + 0.1 * loss_cs + 0.1 * loss_clip + 0.2 * L_cos
+                loss = loss_adv+0.2*loss_cls+0.2*loss_vis + 0.5*L_kt +0.1 * loss_cs + 0.1 * loss_clip + 0.2*L_cos
+                # loss = loss_adv + 0.2 * loss_cls + 0.2 * loss_vis  + 0.1 * loss_cs + 0.1 * loss_clip + 0.1 * L_kd
+                # loss = 0.7*loss_cls + 0.1 * loss_cs + 0.1 * loss_clip+0.1*loss_rel
+                # loss = loss_cls
+
+
+
+                self.writer.add_scalar('train/train_loss', loss, i_acc+i+1)
+
+                # pred = torch.max(out_data, 1)[1]
+                # results = pred == target
+                # correct_points = torch.sum(results.long())
+                #
+                # acc = correct_points.float()/results.size()[0]
+
+                # ======= 计算 Top-5 训练准确率 =======
+                top5_vals, top5_idx = knowledge_data.topk(5, dim=1, largest=True, sorted=True)
+                correct_top5 = (top5_idx == target.unsqueeze(1)).any(dim=1).float()
+                acc = correct_top5.mean()
+
+                # self.writer.add_scalar('train/train_overall_acc', acc, i_acc+i+1)
+                self.writer.add_scalar('train/train_top5_acc', acc, i_acc + i + 1)
+                # self.writer.add_scalar('train/cs_loss', loss_clip.item(), i_acc + i + 1)
+
+                loss.backward()
+                self.optimizer.step()
+
+                # ===== 清理 =====
+                del in_data, target, transposed
+                # del gt_global,gt_knowledge_emb,
+                del retrieved_knowledge,similarity
+                del out_data_feat,
+                del knowledge_weight,knowledge_feat,out_data, knowledge_data
+                del visual_feat, visual_data
+
+                # log_str = 'epoch %d, step %d: train_loss %.3f; train_acc %.3f' % (epoch + 1, i + 1, loss, acc)
+                log_str = f'epoch {epoch + 1}, step {i + 1}: train_loss {loss:.3f}; train_top5_acc {acc:.3f}'
+                if (i + 1) % 100 == 0:
+                    print(log_str)
+                i_acc += i
+
+
+            # evaluation
+            if (epoch + 1) % 1 == 0:
+                with torch.no_grad():
+                    val_loss, metrics = self.update_validation_accuracy(epoch)
+                if metrics['Top-5'] > best_top5:
+                    best_top5 = metrics['Top-5']
+                    torch.save(self.model.state_dict(), self.log_dir + "/best_model.pth")
+                    print(
+                        f"[Epoch {epoch + 1}] Best model saved with Top-5: {best_top5:.4f}, "
+                        f"Top-10: {metrics['Top-10']:.4f}, Macro-F5: {metrics['Macro-F5']:.4f}, "
+                        f"mAP: {metrics['mAP']:.4f}, Precision@5: {metrics['Precision@5']:.4f}")
+                    read_output_Data(metrics, 'records.txt')
+
+            # adjust learning rate manually and (epoch + 1) % M10 == 0
+            if epoch > 0:
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = param_group['lr'] * 0.5
+
+        gc.collect()
+        if hasattr(torch, 'cuda'):
+            try:
+                torch.cuda.empty_cache()
+            except:
+                pass
+
+        # export scalar entropy to JSON for external processing
+        if self.log_dir is not None:
+            self.writer.export_scalars_to_json(self.log_dir + "/all_scalars.json")
+            self.writer.close()
+
+    def update_validation_accuracy(self, epoch):
+        """
+                    更新验证集指标：Top-1/5/10 Accuracy, Macro-F1, mAP, Precision@5
+                    """
+
+        self.model.eval()
+
+        all_targets = []
+        all_preds = []
+        all_probs = []
+
+        topk = (5, 10)
+        correct_topk = {k: 0 for k in topk}
+        total_samples = 0
+        all_loss = 0.0
+
+
+        for _, data in enumerate(self.val_loader, 0):
+            if self.model_name == 'MEKRL':
+                N, V, C, H, W = data[1].size()
+                in_data = data[1].view(-1, C, H, W).cuda()
+            else:
+                in_data = data[1].cuda()
+
+            target = data[0].cuda()
+            # target_single = target.unsqueeze(1).repeat(1, self.num_views).view(-1)
+            transposed = list(zip(*data[2]))
+            # knowledge_emb = data[3]
+            # transposed=data[2]
+
+            # out_data = self.model(in_data)
+            # out_data,view_feats = self.model(in_data)
+            # out_data, _, _= self.model(in_data, transposed)
+            _, _, _ ,out_data_feat= self.model(in_data, transposed)
+            # out_data, _, _, _ = self.model(in_data, transposed)
+            # out_data,_,_ = self.model(in_data,transposed)
+            # out_data, _= self.model(in_data, transposed)
+            # out_data = self.model(in_data, transposed)
+            # out_data = self.model(in_data, target)
+            # out_data, _, _, _, _, _, _ = self.model(in_data, transposed)
+
+            retrieved_knowledge,similarity = self.retrieve_knowledge(
+                out_data_feat,
+                topk=10
+            )
+
+            knowledge_weight = self.filter(
+
+                out_data_feat,
+
+                retrieved_knowledge,
+
+                similarity
+
+            )
+
+            B, K, T, D = retrieved_knowledge.shape
+            retrieved_knowledge = retrieved_knowledge.view(B, K * T, D)
+            knowledge_weight = knowledge_weight.view(B, K * T, 1)
+
+            knowledge_feat = self.kar(
+
+                out_data_feat,
+
+                retrieved_knowledge,
+
+                knowledge_weight
+
+            )
+            # knowledge_feat = self.kar(
+            #     out_data_feat,
+            #     retrieved_knowledge
+            # )
+
+
+            # out_data=self.head(out_data_feat)
+            visual_logits = self.head(out_data_feat)
+            knowledge_logits =self.knowledge_head(knowledge_feat)
+
+            # gate = self.advantage(
+            #     out_data_feat,
+            #     knowledge_feat
+            # )
+            gate = self.advantage(
+
+                out_data_feat,
+
+                knowledge_feat,
+
+                similarity
+
+            )
+
+
+            out_data =(1 - gate) * visual_logits + gate*knowledge_logits
+
+            # softmax 概率
+            probs = torch.softmax(out_data, dim=1).detach().cpu().numpy()
+            preds = out_data.argmax(dim=1).detach().cpu().numpy()
+            target_np = target.detach().cpu().numpy()
+
+            all_targets.extend(target_np)
+            all_preds.extend(preds)
+            all_probs.append(probs)
+
+            # loss
+
+            loss_cls = self.loss_fn(out_data, target).detach().cpu().numpy()
+            loss_vis=F.cross_entropy(visual_logits,target).detach().cpu().numpy()
+            loss_know=F.cross_entropy(knowledge_logits,target).detach().cpu().numpy()
+            loss=loss_cls+0.2*loss_vis+0.2*loss_know
+            # all_loss += loss_cls
+            all_loss += loss
+
+
+            # Top-k
+            topk_vals, topk_idxs = out_data.topk(max(topk), dim=1, largest=True, sorted=True)
+            for k in topk:
+                correct_topk[k] += (topk_idxs[:, :k] == target.unsqueeze(1)).any(dim=1).sum().item()
+            total_samples += target.size(0)
+
+        # 转 numpy
+        all_probs = np.concatenate(all_probs, axis=0)
+        all_targets = np.array(all_targets)
+        num_classes = all_probs.shape[1]
+        one_hot_labels = label_binarize(all_targets, classes=np.arange(num_classes))
+
+        # 计算指标
+        topk_acc = {f'Top-{k}': correct_topk[k] / total_samples for k in topk}
+
+        # ==== Macro-F5 (Top-5 F1) ====
+        top5_preds = np.argsort(all_probs, axis=1)[:, -5:]
+        multi_label_preds = np.zeros_like(all_probs)
+        for i, top5 in enumerate(top5_preds):
+            multi_label_preds[i, top5] = 1
+        macro_f5 = f1_score(one_hot_labels, multi_label_preds, average='macro')
+
+        val_map = average_precision_score(one_hot_labels, all_probs, average='macro')
+
+        # Precision@5
+        top5_idx = np.argsort(all_probs, axis=1)[:, -5:]
+        # precision_at5 = np.mean([target in top5 for target, top5 in zip(all_targets, top5_idx)])
+        hits = np.array([target in top5 for target, top5 in zip(all_targets, top5_idx)])
+        precision_at5 = hits.sum() / (len(all_targets) * 5)
+
+
+        metrics = {**topk_acc, 'Macro-F5': macro_f5, 'mAP': val_map, 'Precision@5': precision_at5}
+        val_loss = all_loss / len(self.val_loader)
+
+        # 写入 TensorBoard
+        for k, v in metrics.items():
+            self.writer.add_scalar(f'val/{k}', float(v), epoch + 1)
+        self.writer.add_scalar('val/loss', float(val_loss), epoch + 1)
+
+        print(f"[Epoch {epoch + 1}] Loss: {val_loss:.4f}, "
+              f"Top-5: {metrics['Top-5']:.4f}, Top-10: {metrics['Top-10']:.4f}, "
+              f"Macro-F5: {metrics['Macro-F5']:.4f}, mAP: {metrics['mAP']:.4f}, Precision@5: {metrics['Precision@5']:.4f}")
+
+        # 清理
+        del all_probs, one_hot_labels
+        del retrieved_knowledge, similarity ,
+        del knowledge_weight,knowledge_feat
+        gc.collect()
+
+        self.model.train()
+
+        return val_loss, metrics
+
